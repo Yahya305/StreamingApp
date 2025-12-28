@@ -1,9 +1,7 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Video, VideoStatus } from './video.entity';
+import { PrismaService } from '../prisma/prisma.service';
 import { VideoProcessorService } from './video-processor.service';
 import { StorageService } from '../storage/storage.service';
 import * as path from 'path';
@@ -15,8 +13,7 @@ export class VideoProcessor extends WorkerHost {
   private readonly logger = new Logger(VideoProcessor.name);
 
   constructor(
-    @InjectRepository(Video)
-    private videoRepository: Repository<Video>,
+    private prisma: PrismaService,
     private videoProcessorService: VideoProcessorService,
     private storageService: StorageService,
   ) {
@@ -27,15 +24,20 @@ export class VideoProcessor extends WorkerHost {
     const { videoId, filePath } = job.data;
     this.logger.log(`Processing video ${videoId}...`);
 
-    const video = await this.videoRepository.findOneBy({ id: videoId });
+    const video = await this.prisma.video.findUnique({
+      where: { id: videoId },
+    });
+
     if (!video) {
       this.logger.error(`Video ${videoId} not found`);
       return;
     }
 
     try {
-      video.status = VideoStatus.PROCESSING;
-      await this.videoRepository.save(video);
+      await this.prisma.video.update({
+        where: { id: videoId },
+        data: { status: 'PROCESSING' },
+      });
 
       const tempOutputDir = path.join(os.tmpdir(), `video-${videoId}`);
       const processedFiles = await this.videoProcessorService.processVideo(
@@ -46,6 +48,7 @@ export class VideoProcessor extends WorkerHost {
       this.logger.log(`Uploading ${processedFiles.length} files to R2...`);
 
       let masterPlaylistUrl = '';
+      let thumbnailUrl = '';
 
       for (const file of processedFiles) {
         const relativePath = path
@@ -62,12 +65,19 @@ export class VideoProcessor extends WorkerHost {
 
         if (relativePath === 'master.m3u8') {
           masterPlaylistUrl = url;
+        } else if (relativePath === 'thumbnail.jpg') {
+          thumbnailUrl = url;
         }
       }
 
-      video.status = VideoStatus.READY;
-      video.masterPlaylistUrl = masterPlaylistUrl;
-      await this.videoRepository.save(video);
+      await this.prisma.video.update({
+        where: { id: videoId },
+        data: {
+          status: 'READY',
+          hlsPath: masterPlaylistUrl,
+          thumbnailUrl: thumbnailUrl,
+        },
+      });
 
       this.logger.log(`Video ${videoId} processed and uploaded successfully.`);
 
@@ -78,8 +88,10 @@ export class VideoProcessor extends WorkerHost {
       }
     } catch (error) {
       this.logger.error(`Error processing video ${videoId}: ${error.message}`);
-      video.status = VideoStatus.FAILED;
-      await this.videoRepository.save(video);
+      await this.prisma.video.update({
+        where: { id: videoId },
+        data: { status: 'FAILED' },
+      });
       throw error;
     }
   }
@@ -91,6 +103,9 @@ export class VideoProcessor extends WorkerHost {
         return 'application/vnd.apple.mpegurl';
       case '.ts':
         return 'video/mp2t';
+      case '.jpg':
+      case '.jpeg':
+        return 'image/jpeg';
       default:
         return 'application/octet-stream';
     }

@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { Upload, X, Film, AlertCircle } from "lucide-react";
+import { Upload, X, Film, AlertCircle, Loader2 } from "lucide-react";
 import { useState } from "react";
+import axios from "axios";
 
 export const Route = createFileRoute("/upload")({
     component: UploadPage,
@@ -9,6 +10,10 @@ export const Route = createFileRoute("/upload")({
 function UploadPage() {
     const [dragActive, setDragActive] = useState(false);
     const [file, setFile] = useState<File | null>(null);
+    const [title, setTitle] = useState("");
+    const [description, setDescription] = useState("");
+    const [uploading, setUploading] = useState(false);
+    const [progress, setProgress] = useState(0);
 
     const handleDrag = (e: React.DragEvent) => {
         e.preventDefault();
@@ -25,7 +30,48 @@ function UploadPage() {
         e.stopPropagation();
         setDragActive(false);
         if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-            setFile(e.dataTransfer.files[0]);
+            const droppedFile = e.dataTransfer.files[0];
+            setFile(droppedFile);
+            if (!title) setTitle(droppedFile.name.split(".")[0]);
+        }
+    };
+
+    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (e.target.files && e.target.files[0]) {
+            const selectedFile = e.target.files[0];
+            setFile(selectedFile);
+            if (!title) setTitle(selectedFile.name.split(".")[0]);
+        }
+    };
+
+    const handleUpload = async () => {
+        if (!file || !title) return;
+
+        setUploading(true);
+        const formData = new FormData();
+        formData.append("video", file);
+        formData.append("title", title);
+        formData.append("description", description);
+
+        try {
+            await axios.post("http://localhost:3000/videos/upload", formData, {
+                onUploadProgress: (progressEvent) => {
+                    const percentCompleted = Math.round(
+                        (progressEvent.loaded * 100) / (progressEvent.total || 1)
+                    );
+                    setProgress(percentCompleted);
+                },
+            });
+            alert("Video uploaded successfully! Processing started.");
+            setFile(null);
+            setTitle("");
+            setDescription("");
+            setProgress(0);
+        } catch (error) {
+            console.error("Upload failed", error);
+            alert("Failed to upload video. Please try again.");
+        } finally {
+            setUploading(false);
         }
     };
 
@@ -33,7 +79,14 @@ function UploadPage() {
         <div className="max-w-4xl mx-auto py-8 px-4">
             <div className="flex items-center justify-between mb-8">
                 <h1 className="text-2xl font-bold">Upload Video</h1>
-                <button className="p-2 hover:bg-accent rounded-full text-muted-foreground transition-colors">
+                <button 
+                    onClick={() => {
+                        setFile(null);
+                        setTitle("");
+                        setDescription("");
+                    }}
+                    className="p-2 hover:bg-accent rounded-full text-muted-foreground transition-colors"
+                >
                     <X className="w-6 h-6" />
                 </button>
             </div>
@@ -51,13 +104,20 @@ function UploadPage() {
                         onDragOver={handleDrag}
                         onDrop={handleDrop}
                     >
+                        <input
+                            type="file"
+                            accept="video/*"
+                            onChange={handleFileSelect}
+                            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                            disabled={uploading}
+                        />
                         {file ? (
                             <div className="space-y-4">
                                 <div className="w-20 h-20 bg-primary/10 rounded-full flex items-center justify-center mx-auto">
                                     <Film className="w-10 h-10 text-primary" />
                                 </div>
                                 <div>
-                                    <p className="font-semibold text-lg">
+                                    <p className="font-semibold text-lg line-clamp-1 px-4">
                                         {file.name}
                                     </p>
                                     <p className="text-sm text-muted-foreground">
@@ -65,12 +125,17 @@ function UploadPage() {
                                         MB
                                     </p>
                                 </div>
-                                <button
-                                    onClick={() => setFile(null)}
-                                    className="text-sm text-destructive hover:underline font-medium"
-                                >
-                                    Remove film
-                                </button>
+                                {!uploading && (
+                                    <button
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            setFile(null);
+                                        }}
+                                        className="text-sm text-destructive hover:underline font-medium relative z-10"
+                                    >
+                                        Remove film
+                                    </button>
+                                )}
                             </div>
                         ) : (
                             <div className="space-y-4">
@@ -86,9 +151,24 @@ function UploadPage() {
                                         publish them.
                                     </p>
                                 </div>
-                                <button className="px-6 py-2.5 bg-primary text-primary-foreground rounded-full text-sm font-semibold hover:bg-primary/90 transition-colors">
+                                <button className="px-6 py-2.5 bg-primary text-primary-foreground rounded-full text-sm font-semibold hover:bg-primary/90 transition-colors pointer-events-none">
                                     SELECT FILES
                                 </button>
+                            </div>
+                        )}
+
+                        {uploading && (
+                            <div className="absolute inset-x-0 bottom-0 p-6 bg-background/80 backdrop-blur-sm rounded-b-2xl">
+                                <div className="flex items-center justify-between mb-2">
+                                    <span className="text-sm font-medium">Uploading...</span>
+                                    <span className="text-sm font-medium">{progress}%</span>
+                                </div>
+                                <div className="w-full bg-secondary h-2 rounded-full overflow-hidden">
+                                    <div 
+                                        className="bg-primary h-full transition-all duration-300"
+                                        style={{ width: `${progress}%` }}
+                                    />
+                                </div>
                             </div>
                         )}
                     </div>
@@ -100,6 +180,9 @@ function UploadPage() {
                             </label>
                             <input
                                 type="text"
+                                value={title}
+                                onChange={(e) => setTitle(e.target.value)}
+                                disabled={uploading}
                                 placeholder="Add a title that describes your video"
                                 className="w-full px-4 py-3 bg-transparent border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all"
                             />
@@ -110,6 +193,9 @@ function UploadPage() {
                             </label>
                             <textarea
                                 rows={5}
+                                value={description}
+                                onChange={(e) => setDescription(e.target.value)}
+                                disabled={uploading}
                                 placeholder="Tell viewers about your video"
                                 className="w-full px-4 py-3 bg-transparent border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all resize-none"
                             />
@@ -132,10 +218,18 @@ function UploadPage() {
                     </div>
 
                     <button
-                        disabled={!file}
-                        className="w-full py-4 bg-primary text-primary-foreground rounded-xl font-bold text-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-primary/20"
+                        disabled={!file || !title || uploading}
+                        onClick={handleUpload}
+                        className="w-full py-4 bg-primary text-primary-foreground rounded-xl font-bold text-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-primary/20 flex items-center justify-center gap-2"
                     >
-                        PUBLISH VIDEO
+                        {uploading ? (
+                            <>
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                UPLOADING...
+                            </>
+                        ) : (
+                            "PUBLISH VIDEO"
+                        )}
                     </button>
                 </div>
             </div>

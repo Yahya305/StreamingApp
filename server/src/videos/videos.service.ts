@@ -1,7 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Video, VideoStatus } from './video.entity';
+import { PrismaService } from '../prisma/prisma.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 
@@ -10,40 +8,38 @@ export class VideosService {
   private readonly logger = new Logger(VideosService.name);
 
   constructor(
-    @InjectRepository(Video)
-    private videoRepository: Repository<Video>,
+    private prisma: PrismaService,
     @InjectQueue('video-processing')
     private videoQueue: Queue,
   ) {}
 
-  async create(
-    title: string,
-    description: string,
-    file: Express.Multer.File,
-  ): Promise<Video> {
-    const video = this.videoRepository.create({
-      title,
-      description,
-      originalFileName: file.originalname,
-      status: VideoStatus.PENDING,
+  async create(title: string, description: string, file: Express.Multer.File) {
+    const video = await this.prisma.video.create({
+      data: {
+        title,
+        description,
+        status: 'PENDING',
+      },
     });
-
-    const savedVideo = await this.videoRepository.save(video);
 
     // Add processing job to queue
     await this.videoQueue.add('process-video', {
-      videoId: savedVideo.id,
+      videoId: video.id,
       filePath: file.path,
     });
 
-    return savedVideo;
+    return video;
   }
 
-  async findAll(): Promise<Video[]> {
-    return this.videoRepository.find({ order: { createdAt: 'DESC' } });
+  async findAll() {
+    return this.prisma.video.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
-  async findOne(id: string): Promise<Video | null> {
-    return this.videoRepository.findOneBy({ id: id as any });
+  async findOne(id: string) {
+    return this.prisma.video.findUnique({
+      where: { id },
+    });
   }
 }
