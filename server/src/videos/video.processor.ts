@@ -4,6 +4,7 @@ import { Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { VideoProcessorService } from './video-processor.service';
 import { StorageService } from '../storage/storage.service';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -16,6 +17,7 @@ export class VideoProcessor extends WorkerHost {
     private prisma: PrismaService,
     private videoProcessorService: VideoProcessorService,
     private storageService: StorageService,
+    private eventEmitter: EventEmitter2,
   ) {
     super();
   }
@@ -43,6 +45,13 @@ export class VideoProcessor extends WorkerHost {
       const processedFiles = await this.videoProcessorService.processVideo(
         filePath,
         tempOutputDir,
+        (percent) => {
+          this.eventEmitter.emit(`video.progress.${videoId}`, {
+            videoId,
+            progress: percent,
+            status: 'PROCESSING',
+          });
+        },
       );
 
       this.logger.log(`Uploading ${processedFiles.length} files to R2...`);
@@ -80,6 +89,12 @@ export class VideoProcessor extends WorkerHost {
       });
 
       this.logger.log(`Video ${videoId} processed and uploaded successfully.`);
+
+      this.eventEmitter.emit(`video.progress.${videoId}`, {
+        videoId,
+        progress: 100,
+        status: 'READY',
+      });
 
       // Cleanup temp files
       fs.rmSync(tempOutputDir, { recursive: true, force: true });

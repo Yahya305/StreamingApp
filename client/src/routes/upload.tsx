@@ -14,6 +14,8 @@ function UploadPage() {
     const [description, setDescription] = useState("");
     const [uploading, setUploading] = useState(false);
     const [progress, setProgress] = useState(0);
+    const [processing, setProcessing] = useState(false);
+    const [processingProgress, setProcessingProgress] = useState(0);
 
     const handleDrag = (e: React.DragEvent) => {
         e.preventDefault();
@@ -54,24 +56,54 @@ function UploadPage() {
         formData.append("description", description);
 
         try {
-            await axios.post("http://localhost:3000/videos/upload", formData, {
-                onUploadProgress: (progressEvent) => {
-                    const percentCompleted = Math.round(
-                        (progressEvent.loaded * 100) /
-                            (progressEvent.total || 1)
-                    );
-                    setProgress(percentCompleted);
-                },
-            });
-            alert("Video uploaded successfully! Processing started.");
-            setFile(null);
-            setTitle("");
-            setDescription("");
-            setProgress(0);
+            const response = await axios.post(
+                "http://localhost:3000/videos/upload",
+                formData,
+                {
+                    onUploadProgress: (progressEvent) => {
+                        const percentCompleted = Math.round(
+                            (progressEvent.loaded * 100) /
+                                (progressEvent.total || 1)
+                        );
+                        setProgress(percentCompleted);
+                    },
+                }
+            );
+
+            const videoId = response.data.id;
+            setUploading(false);
+            setProcessing(true);
+
+            // Start SSE for processing progress
+            const eventSource = new EventSource(
+                `http://localhost:3000/videos/${videoId}/progress`
+            );
+
+            eventSource.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                setProcessingProgress(data.progress);
+
+                if (data.status === "READY") {
+                    eventSource.close();
+                    setProcessing(false);
+                    setProcessingProgress(0);
+                    setFile(null);
+                    setTitle("");
+                    setDescription("");
+                    alert("Video is ready!");
+                }
+            };
+
+            eventSource.onerror = () => {
+                eventSource.close();
+                setProcessing(false);
+                alert(
+                    "Lost connection to processing server, but it's still working in background."
+                );
+            };
         } catch (error) {
             console.error("Upload failed", error);
             alert("Failed to upload video. Please try again.");
-        } finally {
             setUploading(false);
         }
     };
@@ -158,20 +190,27 @@ function UploadPage() {
                             </div>
                         )}
 
-                        {uploading && (
+                        {(uploading || processing) && (
                             <div className="absolute inset-x-0 bottom-0 p-6 bg-background/80 backdrop-blur-sm rounded-b-2xl">
                                 <div className="flex items-center justify-between mb-2">
                                     <span className="text-sm font-medium">
-                                        Uploading...
+                                        {uploading
+                                            ? "Uploading..."
+                                            : "Processing..."}
                                     </span>
                                     <span className="text-sm font-medium">
-                                        {progress}%
+                                        {uploading
+                                            ? progress
+                                            : processingProgress}
+                                        %
                                     </span>
                                 </div>
                                 <div className="w-full bg-secondary h-2 rounded-full overflow-hidden">
                                     <div
                                         className="bg-primary h-full transition-all duration-300"
-                                        style={{ width: `${progress}%` }}
+                                        style={{
+                                            width: `${uploading ? progress : processingProgress}%`,
+                                        }}
                                     />
                                 </div>
                             </div>
@@ -187,7 +226,7 @@ function UploadPage() {
                                 type="text"
                                 value={title}
                                 onChange={(e) => setTitle(e.target.value)}
-                                disabled={uploading}
+                                disabled={uploading || processing}
                                 placeholder="Add a title that describes your video"
                                 className="w-full px-4 py-3 bg-transparent border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all"
                             />
@@ -200,7 +239,7 @@ function UploadPage() {
                                 rows={5}
                                 value={description}
                                 onChange={(e) => setDescription(e.target.value)}
-                                disabled={uploading}
+                                disabled={uploading || processing}
                                 placeholder="Tell viewers about your video"
                                 className="w-full px-4 py-3 bg-transparent border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all resize-none"
                             />
@@ -223,14 +262,14 @@ function UploadPage() {
                     </div>
 
                     <button
-                        disabled={!file || !title || uploading}
+                        disabled={!file || !title || uploading || processing}
                         onClick={handleUpload}
                         className="w-full py-4 bg-primary text-primary-foreground rounded-xl font-bold text-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-primary/20 flex items-center justify-center gap-2"
                     >
-                        {uploading ? (
+                        {uploading || processing ? (
                             <>
                                 <Loader2 className="w-5 h-5 animate-spin" />
-                                UPLOADING...
+                                {uploading ? "UPLOADING..." : "PROCESSING..."}
                             </>
                         ) : (
                             "PUBLISH VIDEO"

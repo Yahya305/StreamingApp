@@ -7,6 +7,9 @@ import {
   UseInterceptors,
   UploadedFile,
   BadRequestException,
+  Sse,
+  MessageEvent,
+  Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { VideosService } from './videos.service';
@@ -14,11 +17,18 @@ import { ApiTags, ApiOperation, ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { diskStorage } from 'multer';
 import * as path from 'path';
 import * as os from 'os';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { fromEvent, map, Observable, merge, of, from } from 'rxjs';
 
 @ApiTags('videos')
 @Controller('videos')
 export class VideosController {
-  constructor(private readonly videosService: VideosService) {}
+  private readonly logger = new Logger(VideosController.name);
+
+  constructor(
+    private readonly videosService: VideosService,
+    private eventEmitter: EventEmitter2,
+  ) {}
 
   @Post('upload')
   @ApiOperation({ summary: 'Upload a video file' })
@@ -84,6 +94,39 @@ export class VideosController {
   @ApiOperation({ summary: 'Get video details' })
   async getVideo(@Param('id') id: string) {
     return this.videosService.findOne(id);
+  }
+
+  @Sse(':id/progress')
+  @ApiOperation({ summary: 'Get real-time processing progress' })
+  getProgress(@Param('id') id: string): Observable<MessageEvent> {
+    this.logger.log(`[SSE] Client connecting for video: ${id}`);
+
+    // Initial event to confirm connection and current status
+    const initialEvent$ = from(this.videosService.findOne(id)).pipe(
+      map((video) => {
+        return {
+          data: {
+            status: video?.status || 'CONNECTED',
+            progress: video?.status === 'READY' ? 100 : 0,
+            videoId: id,
+          },
+        } as MessageEvent;
+      }),
+    );
+
+    const progressEvents$ = fromEvent(
+      this.eventEmitter,
+      `video.progress.${id}`,
+    ).pipe(
+      map((data: any) => {
+        this.logger.log(
+          `[SSE] Sending update for ${id}: ${JSON.stringify(data)}`,
+        );
+        return { data } as MessageEvent;
+      }),
+    );
+
+    return merge(initialEvent$, progressEvents$);
   }
 
   @Post(':id/delete') // Or @Delete(':id')

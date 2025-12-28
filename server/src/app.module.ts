@@ -4,6 +4,7 @@ import { AppService } from './app.service';
 
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { PrismaModule } from './prisma/prisma.module';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 
 import { VideosModule } from './videos/videos.module';
 
@@ -14,6 +15,7 @@ import { BullModule } from '@nestjs/bullmq';
     ConfigModule.forRoot({
       isGlobal: true,
     }),
+    EventEmitterModule.forRoot(),
     PrismaModule,
     BullModule.forRootAsync({
       imports: [ConfigModule],

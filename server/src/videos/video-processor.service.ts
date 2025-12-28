@@ -7,7 +7,11 @@ import * as fs from 'fs';
 export class VideoProcessorService {
   private readonly logger = new Logger(VideoProcessorService.name);
 
-  async processVideo(inputPath: string, outputDir: string): Promise<string[]> {
+  async processVideo(
+    inputPath: string,
+    outputDir: string,
+    onProgress?: (percent: number) => void,
+  ): Promise<string[]> {
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
@@ -18,6 +22,7 @@ export class VideoProcessorService {
     return new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .outputOptions([
+          // ... existing options ...
           '-filter_complex',
           '[0:v]split=3[v1][v2][v3];' +
             '[v1]scale=w=1920:h=1080[v1out];' +
@@ -35,7 +40,7 @@ export class VideoProcessorService {
           '-ac 2',
           '-f hls',
           '-hls_time 10',
-          '-hls_playlist_type vod', // Changed to vod for static content
+          '-hls_playlist_type vod',
           '-hls_segment_filename',
           path.join(outputDir, 'v%v/segment%03d.ts'),
           '-master_pl_name master.m3u8',
@@ -47,6 +52,9 @@ export class VideoProcessorService {
           this.logger.log('Spawned Ffmpeg with command: ' + commandLine);
         })
         .on('progress', (progress) => {
+          if (onProgress && progress.percent) {
+            onProgress(Math.round(progress.percent));
+          }
           this.logger.log(`Processing: ${progress.percent}% done`);
         })
         .on('end', () => {
