@@ -85,4 +85,10 @@ export class VideosController {
   async getVideo(@Param('id') id: string) {
     return this.videosService.findOne(id);
   }
+
+  @Post(':id/delete') // Or @Delete(':id')
+  @ApiOperation({ summary: 'Delete a video' })
+  async remove(@Param('id') id: string) {
+    return this.videosService.remove(id);
+  }
 }

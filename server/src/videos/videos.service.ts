@@ -1,7 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
+import { StorageService } from '../storage/storage.service';
 
 @Injectable()
 export class VideosService {
@@ -9,6 +10,7 @@ export class VideosService {
 
   constructor(
     private prisma: PrismaService,
+    private storageService: StorageService,
     @InjectQueue('video-processing')
     private videoQueue: Queue,
   ) {}
@@ -39,6 +41,24 @@ export class VideosService {
 
   async findOne(id: string) {
     return this.prisma.video.findUnique({
+      where: { id },
+    });
+  }
+
+  async remove(id: string) {
+    const video = await this.prisma.video.findUnique({
+      where: { id },
+    });
+
+    if (!video) {
+      throw new NotFoundException(`Video with ID ${id} not found`);
+    }
+
+    // Delete folder from R2
+    await this.storageService.deletePrefix(`videos/${id}/`);
+
+    // Delete from DB
+    return this.prisma.video.delete({
       where: { id },
     });
   }
