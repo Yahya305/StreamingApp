@@ -57,7 +57,8 @@ function UploadPage() {
             await axios.post("http://localhost:3000/videos/upload", formData, {
                 onUploadProgress: (progressEvent) => {
                     const percentCompleted = Math.round(
-                        (progressEvent.loaded * 100) / (progressEvent.total || 1)
+                        (progressEvent.loaded * 100) /
+                            (progressEvent.total || 1)
                     );
                     setProgress(percentCompleted);
                 },
@@ -79,7 +80,7 @@ function UploadPage() {
         <div className="max-w-4xl mx-auto py-8 px-4">
             <div className="flex items-center justify-between mb-8">
                 <h1 className="text-2xl font-bold">Upload Video</h1>
-                <button 
+                <button
                     onClick={() => {
                         setFile(null);
                         setTitle("");
@@ -160,11 +161,15 @@ function UploadPage() {
                         {uploading && (
                             <div className="absolute inset-x-0 bottom-0 p-6 bg-background/80 backdrop-blur-sm rounded-b-2xl">
                                 <div className="flex items-center justify-between mb-2">
-                                    <span className="text-sm font-medium">Uploading...</span>
-                                    <span className="text-sm font-medium">{progress}%</span>
+                                    <span className="text-sm font-medium">
+                                        Uploading...
+                                    </span>
+                                    <span className="text-sm font-medium">
+                                        {progress}%
+                                    </span>
                                 </div>
                                 <div className="w-full bg-secondary h-2 rounded-full overflow-hidden">
-                                    <div 
+                                    <div
                                         className="bg-primary h-full transition-all duration-300"
                                         style={{ width: `${progress}%` }}
                                     />
