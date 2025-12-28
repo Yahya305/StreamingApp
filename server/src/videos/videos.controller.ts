@@ -116,10 +116,7 @@ export class VideosController {
                 return {
                     data: {
                         status: video?.status || "CONNECTED",
-                        progress:
-                            video?.status === "READY"
-                                ? 100
-                                : video?.progress || 0,
+                        progress: (video as any)?.progress || 0,
                         videoId: id,
                     },
                 } as MessageEvent;

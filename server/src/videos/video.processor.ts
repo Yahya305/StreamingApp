@@ -5,6 +5,7 @@ import { PrismaService } from "../prisma/prisma.service";
 import { VideoProcessorService } from "./video-processor.service";
 import { StorageService } from "../storage/storage.service";
 import { EventEmitter2 } from "@nestjs/event-emitter";
+import { RedisService } from "../redis/redis.service";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
@@ -17,7 +18,8 @@ export class VideoProcessor extends WorkerHost {
         private prisma: PrismaService,
         private videoProcessorService: VideoProcessorService,
         private storageService: StorageService,
-        private eventEmitter: EventEmitter2
+        private eventEmitter: EventEmitter2,
+        private redisService: RedisService
     ) {
         super();
     }
@@ -66,11 +68,8 @@ export class VideoProcessor extends WorkerHost {
                     localInputPath,
                     tempOutputDir,
                     async (percent) => {
-                        // Update DB with progress
-                        await this.prisma.video.update({
-                            where: { id: videoId },
-                            data: { progress: percent },
-                        });
+                        // Update Redis with progress (No more DB writes!)
+                        await this.redisService.setProgress(videoId, percent);
 
                         this.eventEmitter.emit(`video.progress.${videoId}`, {
                             videoId,
@@ -113,9 +112,11 @@ export class VideoProcessor extends WorkerHost {
                     status: "READY",
                     hlsPath: masterPlaylistUrl,
                     thumbnailUrl: thumbnailUrl,
-                    progress: 100,
                 },
             });
+
+            // Cleanup Redis progress
+            await this.redisService.deleteProgress(videoId);
 
             this.logger.log(
                 `Video ${videoId} processed and uploaded successfully.`

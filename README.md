@@ -10,103 +10,54 @@ We didn't just upload a file to a folder; we built a system that handles **trans
 
 We use a **High-Performance Direct-to-Storage** architecture. Instead of the server acting as a middleman for large video files, the browser communicates directly with Cloudflare R2 for uploads, while the server coordinates the process and handles background transcoding.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User as 👤 User
-    participant Client as 💻 Frontend (React)
-    participant Server as 🚀 Backend (NestJS)
-    participant R2 as ☁️ Cloudflare R2
-    participant Queue as 📨 BullMQ/Redis
-    participant Worker as ⚙️ Processor (Worker)
-
-    Note over User, R2: Phase 1: Resumable Upload
-    User->>Client: Selects Video
-    Client->>Client: Generate File Fingerprint
-    Client->>Server: POST /videos/init-upload
-    Server->>R2: CreateMultipartUpload
-    Server-->>Client: uploadId & videoId
-
-    loop Each 10MB Chunk
-        Client->>Server: GET /videos/upload-url
-        Server-->>Client: Signed PUT URL
-        Client->>R2: PUT chunk (Direct Upload)
-    end
-
-    Client->>Server: POST /videos/complete-upload
-    Server->>R2: CompleteMultipartUpload
-    Server->>Queue: Add Job { isUrl: true }
-    Server-->>Client: Status: PROCESSING
-
-    Note over Queue, Worker: Phase 2: Background Transcoding
-    Queue->>Worker: Pick up job
-    Worker->>R2: Download original MP4
-    Worker->>Worker: FFmpeg: Transcode to HLS (3 Qualities)
-    Worker->>R2: Upload HLS Segments (.ts) & Playlists
-    Worker->>R2: Delete original MP4
-    Worker-->>Server: Emit Progress via SSE
-
-    Note over Client, R2: Phase 3: Streaming Playback
-    Worker->>Server: Update DB: READY
-    Server-->>Client: SSE: "Ready to Play"
-    User->>Client: Clicks Watch
-    Client->>R2: Stream HLS via HLS.js
-```
+![Video Streaming Architecture Diagram](client/public/FlowDiagram.svg)
 
 ---
 
 ## 🛠️ The Tech Stack (What & Why?)
 
-| Component      | Technology               | Why we used it?                                                                           |
-| -------------- | ------------------------ | ----------------------------------------------------------------------------------------- |
-| **Frontend**   | React + Vite             | Fast, responsive UI.                                                                      |
-| **Backend**    | NestJS                   | Robust, scalable Node.js framework. Great for structured code.                            |
-| **Database**   | PostgreSQL + Prisma      | Reliable SQL database with an amazing ORM (Prisma) for type-safety.                       |
-| **Queue**      | BullMQ + Redis           | Handles heavy background tasks (video processing) without freezing the main server.       |
-| **Processing** | FFmpeg                   | The "Swiss Army Knife" of video and audio processing. Converts formats.                   |
-| **Storage**    | Cloudflare R2            | S3-compatible object storage. Cheaper than AWS S3 and has zero egress fees!               |
-| **Playback**   | HLS.js                   | Allows browsers to play HLS streams (which native HTML5 video tags often can't do alone). |
-| **Status**     | SSE (Server-Sent Events) | Real-time connection to show the user "Processing 45%..." without refreshing.             |
+| Component            | Technology               | Why we used it?                                                                     |
+| -------------------- | ------------------------ | ----------------------------------------------------------------------------------- |
+| **Frontend**         | React + Vite             | Fast, responsive UI with `axios` for chunking and `hls.js` for playback.            |
+| **Backend**          | NestJS                   | Provides the API and coordinates R2/Redis/Postgres interactions.                    |
+| **Database**         | PostgreSQL + Prisma      | Stores stable metadata (titles, status, paths). No redundant hot-writes.            |
+| **Caching/Hot Data** | **Redis (IOREDIS)**      | **Crucial for performance.** Tracks real-time transcoding progress and powers jobs. |
+| **Processing**       | FFmpeg                   | Transcodes raw MP4s into Adaptive HLS streams (360p, 720p, 1080p).                  |
+| **Storage**          | Cloudflare R2            | S3-compatible, ZERO egress fees. Perfect for video delivery.                        |
+| **Status**           | SSE (Server-Sent Events) | Pushes live progress from Redis to your browser instantly.                          |
 
 ---
 
 ## 🔍 Detailed Step-by-Step Breakdown
 
-### 1️⃣ The "Direct" Upload (Client → R2)
+### 1️⃣ Resumable Chunked Upload (Client → R2)
 
-**The Problem:** Large files (2GB+) fail easily and waste server bandwidth if the server acts as a proxy.
-**The Solution:** Direct-to-R2 Resumable Uploads.
+**The Problem:** Uploading 5GB files in one go leads to timeouts.
+**The Solution:** 10MB Chunking & Local Tracking.
 
--   **Fingerprinting**: We identify files by name, size, and date. If you refresh, the app remembers where you left off.
--   **Signed URLs**: The server gives the browser a temporary "Security Pass" (Signed URL) to upload chunks directly to Cloudflare.
--   **Multipart Upload**: Files are sent in 10MB chunks. If one fails, only that chunk is re-sent.
+-   **Fingerprinting**: We use the file's name, size, and last modified date to create a unique ID.
+-   **Direct Upload**: We use **Cloudflare R2 Multipart Upload**. The server only generates "Permission Tokens" (Signed URLs) while the browser does the heavy lifting.
+-   **Resumption**: If your internet cuts out at 70%, the app checks `localStorage` and only uploads the remaining chunks.
 
-### 2️⃣ The "Fire and Forget" (Queueing)
+### 2️⃣ Redis-Powered Progress Tracking
 
-**The Problem:** Transcoding a video takes minutes.
-**The Solution:** Asynchronous Processing via BullMQ.
+**The Problem:** Updating a database table every second to show "45%, 46%, 47%..." is a bottleneck.
+**The Solution:** Redis Hybrid Architecture.
 
--   **Backend**: Once R2 confirms all chunks are in, we trigger a background job.
--   **Response**: We immediately tell the user: _"Upload Complete! We are processing your video."_
+-   **Hot Data (Redis)**: As FFmpeg works, it updates a simple key-value pair in Redis. This is incredibly fast and saves the database from thousands of unnecessary "Write" queries.
+-   **Stable Data (Postgres)**: We only update the database once at the very end (status: `READY`).
+-   **The Result**: A blazing fast UI that doesn't slow down the main database.
 
-### 3️⃣ Real-Time Feedback (SSE)
+### 3️⃣ Adaptive Bitrate (HLS)
 
-**The Problem:** Users hate waiting without knowing what's happening.
-**The Solution:** Server-Sent Events (SSE).
+-   We convert your video into **HLS (HTTP Live Streaming)**.
+-   Instead of one big file, we serve thousands of 2-second segments.
+-   The player automatically switches between 360p (Low) and 1080p (High) based on the user's internet speed—exactly like YouTube.
 
--   **Progress Tracking**: As FFmpeg works, it tells the database its current percentage.
--   **SSE Stream**: The frontend listens to a persistent stream. Any change in the DB or internal events is "pushed" to the user instantly.
+### 4️⃣ Cleanup & Storage Efficiency
 
-### 4️⃣ The Heavy Lifting (FFmpeg & HLS)
-
--   **Worker (`video.processor.ts`)**: The background process downloads the original MP4 from R2.
--   **FFmpeg**: It splits the video into hundreds of tiny segments versioned for 360p, 720p, and 1080p.
--   **Adaptive Bitrate**: This allows the video player to automatically drop to 360p if your internet slows down, preventing buffering.
-
-### 5️⃣ Cleanup & Security
-
--   **Storage Optimization**: Once HLS transcoding is finished and uploaded back to R2, we **delete the original MP4** to save storage costs.
--   **CORS**: We've configured R2 to only allow uploads from specific frontend domains.
+-   **Original Cleanup**: Once the HLS version (the streamable one) is ready, we **delete the original MP4** from R2 to keep costs low.
+-   **Surgical Cleanup**: We've implemented specialist scripts to wipe old test folders and sync the database schema.
 
 ---
 

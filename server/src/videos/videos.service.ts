@@ -3,6 +3,7 @@ import { PrismaService } from "../prisma/prisma.service";
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
 import { StorageService } from "../storage/storage.service";
+import { RedisService } from "../redis/redis.service";
 
 @Injectable()
 export class VideosService {
@@ -11,6 +12,7 @@ export class VideosService {
     constructor(
         private prisma: PrismaService,
         private storageService: StorageService,
+        private redisService: RedisService,
         @InjectQueue("video-processing")
         private videoQueue: Queue
     ) {}
@@ -38,15 +40,37 @@ export class VideosService {
     }
 
     async findAll() {
-        return this.prisma.video.findMany({
+        const videos = await this.prisma.video.findMany({
             orderBy: { createdAt: "desc" },
         });
+
+        // Merge live progress from Redis for processing videos
+        return Promise.all(
+            videos.map(async (v) => {
+                if (v.status === "PROCESSING") {
+                    const progress = await this.redisService.getProgress(v.id);
+                    return { ...v, progress: progress || 0 };
+                }
+                return { ...v, progress: v.status === "READY" ? 100 : 0 };
+            })
+        );
     }
 
     async findOne(id: string) {
-        return this.prisma.video.findUnique({
+        const video = await this.prisma.video.findUnique({
             where: { id },
         });
+
+        if (video && video.status === "PROCESSING") {
+            const progress = await this.redisService.getProgress(id);
+            return { ...video, progress: progress || 0 };
+        }
+
+        if (video) {
+            return { ...video, progress: video.status === "READY" ? 100 : 0 };
+        }
+
+        return video;
     }
 
     async remove(id: string) {
