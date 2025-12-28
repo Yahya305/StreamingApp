@@ -1,11 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Upload, X, Film, AlertCircle, Loader2 } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import axios from "axios";
 
 export const Route = createFileRoute("/upload")({
     component: UploadPage,
 });
+
+const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
 
 function UploadPage() {
     const [dragActive, setDragActive] = useState(false);
@@ -46,66 +48,150 @@ function UploadPage() {
         }
     };
 
+    // Calculate fingerprint to identify file for resume
+    const getFileFingerprint = (file: File) => {
+        return `${file.name}-${file.size}-${file.lastModified}`;
+    };
+
     const handleUpload = async () => {
         if (!file || !title) return;
 
         setUploading(true);
-        const formData = new FormData();
-        formData.append("video", file);
-        formData.append("title", title);
-        formData.append("description", description);
+        const fingerprint = getFileFingerprint(file);
+        const savedUpload = localStorage.getItem(`upload_${fingerprint}`);
+        let { videoId, uploadId, key, uploadedParts } = savedUpload
+            ? JSON.parse(savedUpload)
+            : { videoId: null, uploadId: null, key: null, uploadedParts: [] };
 
         try {
-            const response = await axios.post(
-                "http://localhost:3000/videos/upload",
-                formData,
-                {
-                    onUploadProgress: (progressEvent) => {
-                        const percentCompleted = Math.round(
-                            (progressEvent.loaded * 100) /
-                                (progressEvent.total || 1)
-                        );
-                        setProgress(percentCompleted);
-                    },
-                }
-            );
-
-            const videoId = response.data.id;
-            setUploading(false);
-            setProcessing(true);
-
-            // Start SSE for processing progress
-            const eventSource = new EventSource(
-                `http://localhost:3000/videos/${videoId}/progress`
-            );
-
-            eventSource.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                setProcessingProgress(data.progress);
-
-                if (data.status === "READY") {
-                    eventSource.close();
-                    setProcessing(false);
-                    setProcessingProgress(0);
-                    setFile(null);
-                    setTitle("");
-                    setDescription("");
-                    alert("Video is ready!");
-                }
-            };
-
-            eventSource.onerror = () => {
-                eventSource.close();
-                setProcessing(false);
-                alert(
-                    "Lost connection to processing server, but it's still working in background."
+            // 1. Initialize or Resume Upload
+            if (!uploadId) {
+                const initRes = await axios.post(
+                    "http://localhost:3000/videos/init-upload",
+                    {
+                        title,
+                        description,
+                        fileName: file.name,
+                        contentType: file.type || "video/mp4",
+                    }
                 );
-            };
+                videoId = initRes.data.videoId;
+                uploadId = initRes.data.uploadId;
+                key = initRes.data.key;
+
+                localStorage.setItem(
+                    `upload_${fingerprint}`,
+                    JSON.stringify({
+                        videoId,
+                        uploadId,
+                        key,
+                        uploadedParts: [],
+                    })
+                );
+            }
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const parts = [...uploadedParts];
+
+            // 2. Upload Chunks
+            for (let i = 0; i < totalChunks; i++) {
+                const partNumber = i + 1;
+
+                // Skip if already uploaded
+                if (parts.find((p) => p.PartNumber === partNumber)) {
+                    continue;
+                }
+
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(start + CHUNK_SIZE, file.size);
+                const chunk = file.slice(start, end);
+
+                // Get Signed URL
+                const urlRes = await axios.get(
+                    "http://localhost:3000/videos/upload-url",
+                    {
+                        params: { key, uploadId, partNumber },
+                    }
+                );
+
+                // Direct PUT to R2
+                const uploadRes = await axios.put(
+                    urlRes.data.signedUrl,
+                    chunk,
+                    {
+                        headers: { "Content-Type": file.type || "video/mp4" },
+                        onUploadProgress: (p) => {
+                            const chunkProgress =
+                                (p.loaded / (p.total || 1)) * 100;
+                            const overallProgress = Math.round(
+                                ((i + chunkProgress / 100) / totalChunks) * 100
+                            );
+                            setProgress(overallProgress);
+                        },
+                    }
+                );
+
+                const etag = uploadRes.headers.etag;
+                parts.push({ ETag: etag, PartNumber: partNumber });
+
+                // Save progress
+                localStorage.setItem(
+                    `upload_${fingerprint}`,
+                    JSON.stringify({
+                        videoId,
+                        uploadId,
+                        key,
+                        uploadedParts: parts,
+                    })
+                );
+            }
+
+            // 3. Complete Upload
+            setProgress(100);
+            await axios.post("http://localhost:3000/videos/complete-upload", {
+                videoId,
+                uploadId,
+                key,
+                parts,
+            });
+
+            localStorage.removeItem(`upload_${fingerprint}`);
+            setUploading(false);
+            startProcessingStatus(videoId);
         } catch (error) {
             console.error("Upload failed", error);
-            alert("Failed to upload video. Please try again.");
+            alert(
+                "Upload failed. Don't worry, you can resume by selecting the same file again!"
+            );
             setUploading(false);
         }
+    };
+
+    const startProcessingStatus = (videoId: string) => {
+        setProcessing(true);
+        const eventSource = new EventSource(
+            `http://localhost:3000/videos/${videoId}/progress`
+        );
+
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            setProcessingProgress(data.progress);
+
+            if (data.status === "READY") {
+                eventSource.close();
+                setProcessing(false);
+                setProcessingProgress(0);
+                setFile(null);
+                setTitle("");
+                setDescription("");
+                alert("Video is ready! 🚀");
+            }
+        };
+
+        eventSource.onerror = () => {
+            eventSource.close();
+            // We don't alert here to avoid annoying users if connection blips
+        };
     };
 
     return (
@@ -142,7 +228,7 @@ function UploadPage() {
                             accept="video/*"
                             onChange={handleFileSelect}
                             className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                            disabled={uploading}
+                            disabled={uploading || processing}
                         />
                         {file ? (
                             <div className="space-y-4">
@@ -158,7 +244,7 @@ function UploadPage() {
                                         MB
                                     </p>
                                 </div>
-                                {!uploading && (
+                                {!uploading && !processing && (
                                     <button
                                         onClick={(e) => {
                                             e.preventDefault();
@@ -195,7 +281,7 @@ function UploadPage() {
                                 <div className="flex items-center justify-between mb-2">
                                     <span className="text-sm font-medium">
                                         {uploading
-                                            ? "Uploading..."
+                                            ? "Uploading Chunks..."
                                             : "Processing..."}
                                     </span>
                                     <span className="text-sm font-medium">
@@ -251,13 +337,16 @@ function UploadPage() {
                     <div className="bg-secondary/30 p-6 rounded-2xl border border-border">
                         <h3 className="font-semibold mb-4 flex items-center gap-2 text-primary">
                             <AlertCircle className="w-4 h-4" />
-                            Upload Tips
+                            Resumable Upload
                         </h3>
+                        <p className="text-xs text-muted-foreground mb-3">
+                            Internet disconnected? Just select the same file
+                            again to resume where you left off.
+                        </p>
                         <ul className="text-sm space-y-3 text-muted-foreground">
-                            <li>• Supported formats: .mp4, .mov, .avi</li>
-                            <li>• Max file size: 2GB</li>
-                            <li>• Recommended ratio: 16:9</li>
-                            <li>• Use keywords in title for better search</li>
+                            <li>• Part size: 10MB</li>
+                            <li>• Max file size: Unlimited</li>
+                            <li>• Automatic retries enabled</li>
                         </ul>
                     </div>
 

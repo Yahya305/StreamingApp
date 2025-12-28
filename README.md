@@ -8,9 +8,50 @@ We didn't just upload a file to a folder; we built a system that handles **trans
 
 ## 🏗️ High-Level Architecture
 
-Before diving into the code, let's look at the flow of data. We use a **Microservices-style** architecture (even though it's a monolith mostly) where the "Heavy Lifting" (processing video) is separated from the "API" (handling users).
+We use a **High-Performance Direct-to-Storage** architecture. Instead of the server acting as a middleman for large video files, the browser communicates directly with Cloudflare R2 for uploads, while the server coordinates the process and handles background transcoding.
 
-![Video Streaming Architecture Diagram](client/public/FlowDiagram.svg)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 👤 User
+    participant Client as 💻 Frontend (React)
+    participant Server as 🚀 Backend (NestJS)
+    participant R2 as ☁️ Cloudflare R2
+    participant Queue as 📨 BullMQ/Redis
+    participant Worker as ⚙️ Processor (Worker)
+
+    Note over User, R2: Phase 1: Resumable Upload
+    User->>Client: Selects Video
+    Client->>Client: Generate File Fingerprint
+    Client->>Server: POST /videos/init-upload
+    Server->>R2: CreateMultipartUpload
+    Server-->>Client: uploadId & videoId
+
+    loop Each 10MB Chunk
+        Client->>Server: GET /videos/upload-url
+        Server-->>Client: Signed PUT URL
+        Client->>R2: PUT chunk (Direct Upload)
+    end
+
+    Client->>Server: POST /videos/complete-upload
+    Server->>R2: CompleteMultipartUpload
+    Server->>Queue: Add Job { isUrl: true }
+    Server-->>Client: Status: PROCESSING
+
+    Note over Queue, Worker: Phase 2: Background Transcoding
+    Queue->>Worker: Pick up job
+    Worker->>R2: Download original MP4
+    Worker->>Worker: FFmpeg: Transcode to HLS (3 Qualities)
+    Worker->>R2: Upload HLS Segments (.ts) & Playlists
+    Worker->>R2: Delete original MP4
+    Worker-->>Server: Emit Progress via SSE
+
+    Note over Client, R2: Phase 3: Streaming Playback
+    Worker->>Server: Update DB: READY
+    Server-->>Client: SSE: "Ready to Play"
+    User->>Client: Clicks Watch
+    Client->>R2: Stream HLS via HLS.js
+```
 
 ---
 
@@ -31,62 +72,41 @@ Before diving into the code, let's look at the flow of data. We use a **Microser
 
 ## 🔍 Detailed Step-by-Step Breakdown
 
-### 1️⃣ The Upload (Client → Server)
+### 1️⃣ The "Direct" Upload (Client → R2)
 
-**The Problem:** Video files are huge (GBs). We can't just read them into memory.
-**The Solution:** Streams & Multipart Uploads.
+**The Problem:** Large files (2GB+) fail easily and waste server bandwidth if the server acts as a proxy.
+**The Solution:** Direct-to-R2 Resumable Uploads.
 
--   **Frontend (`upload.tsx`)**: We use `axios` to send the file. We attach an `onUploadProgress` listener to show the _network_ upload percentage (User's PC → Server).
--   **Backend (`videos.controller.ts`)**: We use **Multer**. Multer is middleware that takes the incoming stream and saves it to a temporary folder (`/tmp`) on the server.
-    -   _Why temp?_ We don't want to keep the raw file forever. We just need it long enough to process it.
+-   **Fingerprinting**: We identify files by name, size, and date. If you refresh, the app remembers where you left off.
+-   **Signed URLs**: The server gives the browser a temporary "Security Pass" (Signed URL) to upload chunks directly to Cloudflare.
+-   **Multipart Upload**: Files are sent in 10MB chunks. If one fails, only that chunk is re-sent.
 
 ### 2️⃣ The "Fire and Forget" (Queueing)
 
-**The Problem:** Transcoding a video takes time (minutes). If we did this in the API request, the user's browser would freeze waiting for a response.
-**The Solution:** Asynchronous Processing.
+**The Problem:** Transcoding a video takes minutes.
+**The Solution:** Asynchronous Processing via BullMQ.
 
--   **Backend (`videos.service.ts`)**: Once the file is safely in `/tmp`, we create a database entry with status `PENDING`.
--   **BullMQ**: We immediately add a generic "job" to our Redis queue: `{ videoId: '123', filePath: '/tmp/file-123.mp4' }`.
--   **Response**: We reply to the user: _"Got it! Here is ID 123. We are working on it."_
+-   **Backend**: Once R2 confirms all chunks are in, we trigger a background job.
+-   **Response**: We immediately tell the user: _"Upload Complete! We are processing your video."_
 
 ### 3️⃣ Real-Time Feedback (SSE)
 
-**The Problem:** The user wants to know when the video is ready.
+**The Problem:** Users hate waiting without knowing what's happening.
 **The Solution:** Server-Sent Events (SSE).
 
--   **Frontend**: Opens a one-way connection: `new EventSource('/videos/123/progress')`.
--   **Backend**: We use `EventEmitter2`. When the background worker makes progress, it emits an event internally. The Controller catches this event and pushes it down the SSE pipe to the browser.
--   **Why SSE?** It's lighter than WebSockets and perfect for "Server notifying Client" scenarios.
+-   **Progress Tracking**: As FFmpeg works, it tells the database its current percentage.
+-   **SSE Stream**: The frontend listens to a persistent stream. Any change in the DB or internal events is "pushed" to the user instantly.
 
 ### 4️⃣ The Heavy Lifting (FFmpeg & HLS)
 
-**The Problem:** A raw `.mp4` file is hard to stream. It doesn't adjust quality if the user has slow internet.
-**The Solution:** HTTP Live Streaming (HLS).
+-   **Worker (`video.processor.ts`)**: The background process downloads the original MP4 from R2.
+-   **FFmpeg**: It splits the video into hundreds of tiny segments versioned for 360p, 720p, and 1080p.
+-   **Adaptive Bitrate**: This allows the video player to automatically drop to 360p if your internet slows down, preventing buffering.
 
--   **Worker (`video.processor.ts`)**: A background process picks up the job.
--   **FFmpeg**: We run a complex command that splits the video into tiny 10-second chunks (`.ts` files) and creates multiple quality versions (360p, 720p, 1080p).
-    -   **`master.m3u8`**: A "menu" file that tells the player which qualities are available.
-    -   **`index.m3u8`**: A playlist for each specific quality.
+### 5️⃣ Cleanup & Security
 
-### 5️⃣ Cloud Storage (R2)
-
-**The Problem:** Storing videos on the server disk is bad. If the server crashes, data is lost. If we add more servers, they can't share files easily.
-**The Solution:** Object Storage (Cloudflare R2).
-
--   **S3 Compatibility**: R2 speaks the same language as AWS S3. We use the `@aws-sdk/client-s3` library.
--   **Upload**: As FFmpeg finishes, we upload all those `.ts` chunks and `.m3u8` playlists to R2.
--   **Organization**: We store them neatly: `videos/{videoId}/v0/segment001.ts`.
-
-### 6️⃣ Cleanup & Public Access
-
--   **Cleanup**: Once uploaded, we delete the file from the server's `/tmp` folder to save space.
--   **Public URL**: R2 gives us a public URL (e.g., `https://pub-xyz.r2.dev`). We generate the full URL for the `master.m3u8` and save it to the database:
-    -   `hlsPath`: `https://pub-xyz.r2.dev/videos/123/master.m3u8`
-
-### 7️⃣ Playback (The Finale)
-
--   **Frontend (`watch.tsx`)**: When the user goes to watch the video, we fetch the video details.
--   **HLS.js**: We attach the `hls.js` library to the `<video>` element. It reads the `master.m3u8`, checks the user's internet speed, and automatically picks the best quality chunk to download next.
+-   **Storage Optimization**: Once HLS transcoding is finished and uploaded back to R2, we **delete the original MP4** to save storage costs.
+-   **CORS**: We've configured R2 to only allow uploads from specific frontend domains.
 
 ---
 
@@ -97,17 +117,15 @@ Before diving into the code, let's look at the flow of data. We use a **Microser
     docker compose up -d postgres redis
     ```
 2. **Setup Env**:
-   Make sure you have `.env` with `R2_` credentials and `DATABASE_URL`.
-3. **Run Server**:
+   Add `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_S3_API`, and `R2_BUCKET_NAME` to your server `.env`.
+3. **Database Setup**:
     ```bash
     cd server
     npx prisma migrate dev
-    npm run start:dev
+    npx prisma generate
     ```
-4. **Run Client**:
-    ```bash
-    cd client
-    npm run dev
-    ```
+4. **Run Everything**:
+    - **Server**: `npm run start:dev` (in `server` folder)
+    - **Client**: `npm run dev` (in `client` folder)
 
 Happy Streaming! 🍿

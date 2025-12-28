@@ -10,14 +10,16 @@ import {
     Sse,
     MessageEvent,
     Logger,
+    Query,
+    Delete,
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
 import { VideosService } from "./videos.service";
 import { ApiTags, ApiOperation, ApiConsumes, ApiBody } from "@nestjs/swagger";
 import { EventEmitter2 } from "@nestjs/event-emitter";
-import { fromEvent, map, Observable, merge, of, from } from "rxjs";
-
+import { fromEvent, map, Observable, merge, from } from "rxjs";
 import { videoUploadOptions } from "./video-upload.config";
+import { StorageService } from "../storage/storage.service";
 
 @ApiTags("videos")
 @Controller("videos")
@@ -26,35 +28,70 @@ export class VideosController {
 
     constructor(
         private readonly videosService: VideosService,
-        private eventEmitter: EventEmitter2
+        private eventEmitter: EventEmitter2,
+        private storageService: StorageService
     ) {}
 
-    @Post("upload")
-    @ApiOperation({ summary: "Upload a video file" })
-    @ApiConsumes("multipart/form-data")
-    @ApiBody({
-        schema: {
-            type: "object",
-            properties: {
-                title: { type: "string" },
-                description: { type: "string" },
-                video: {
-                    type: "string",
-                    format: "binary",
-                },
-            },
-        },
-    })
-    @UseInterceptors(FileInterceptor("video", videoUploadOptions))
-    async uploadVideo(
-        @UploadedFile() file: Express.Multer.File,
-        @Body("title") title: string,
-        @Body("description") description: string
-    ) {
-        if (!file) {
-            throw new BadRequestException("Video file is required");
+    @Post("init-upload")
+    @ApiOperation({ summary: "Initialize a resumable multipart upload" })
+    async initUpload(
+        @Body()
+        body: {
+            title: string;
+            description: string;
+            fileName: string;
+            contentType: string;
         }
-        return this.videosService.create(title, description, file);
+    ) {
+        const video = await this.videosService.createPlaceholder(
+            body.title,
+            body.description
+        );
+        const key = `uploads/${video.id}/${body.fileName}`;
+        const uploadId = await this.storageService.startMultipartUpload(
+            key,
+            body.contentType
+        );
+
+        return { videoId: video.id, uploadId, key };
+    }
+
+    @Get("upload-url")
+    @ApiOperation({ summary: "Get a signed URL for a specific part" })
+    async getUploadUrl(
+        @Query("key") key: string,
+        @Query("uploadId") uploadId: string,
+        @Query("partNumber") partNumber: string
+    ) {
+        const signedUrl = await this.storageService.getSignedUrlForPart(
+            key,
+            uploadId,
+            Number(partNumber)
+        );
+        return { signedUrl };
+    }
+
+    @Post("complete-upload")
+    @ApiOperation({ summary: "Complete a multipart upload" })
+    async completeUpload(
+        @Body()
+        body: {
+            videoId: string;
+            uploadId: string;
+            key: string;
+            parts: { ETag: string; PartNumber: number }[];
+        }
+    ) {
+        const finalUrl = await this.storageService.completeMultipartUpload(
+            body.key,
+            body.uploadId,
+            body.parts
+        );
+
+        // Update video status and initiate background processing
+        await this.videosService.finalizeUpload(body.videoId, finalUrl);
+
+        return { success: true, videoId: body.videoId };
     }
 
     @Get()
@@ -74,13 +111,15 @@ export class VideosController {
     getProgress(@Param("id") id: string): Observable<MessageEvent> {
         this.logger.log(`[SSE] Client connecting for video: ${id}`);
 
-        // Initial event to confirm connection and current status
         const initialEvent$ = from(this.videosService.findOne(id)).pipe(
             map((video) => {
                 return {
                     data: {
                         status: video?.status || "CONNECTED",
-                        progress: video?.status === "READY" ? 100 : 0,
+                        progress:
+                            video?.status === "READY"
+                                ? 100
+                                : video?.progress || 0,
                         videoId: id,
                     },
                 } as MessageEvent;
@@ -102,7 +141,7 @@ export class VideosController {
         return merge(initialEvent$, progressEvents$);
     }
 
-    @Post(":id/delete") // Or @Delete(':id')
+    @Delete(":id")
     @ApiOperation({ summary: "Delete a video" })
     async remove(@Param("id") id: string) {
         return this.videosService.remove(id);
