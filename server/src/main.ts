@@ -16,15 +16,15 @@ async function bootstrap() {
     }),
   );
 
-  const config = new DocumentBuilder()
+  const swaggerConfig = new DocumentBuilder()
     .setTitle('Video Streaming API')
     .setDescription('The video streaming platform API description')
     .setVersion('1.0')
     .addTag('videos')
     .build();
-  const document = SwaggerModule.createDocument(app, config);
+  const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('api', app, document);
 
-  await app.listen(process.env.PORT ?? 3000);
+  await app.listen(process.env.SERVER_PORT ?? 3000,()=>console.log(`Server running on port ${process.env.SERVER_PORT}`));
 }
 bootstrap();
