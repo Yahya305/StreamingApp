@@ -61,6 +61,51 @@ We use a **High-Performance Direct-to-Storage** architecture. Instead of the ser
 
 ---
 
+## ☁️ Cloudflare R2 Configuration (Dashboard Steps)
+
+To make everything work, you **must** configure your R2 bucket correctly in the Cloudflare Dashboard.
+
+### 1️⃣ Create a Bucket
+
+-   Go to R2 > **Create Bucket**.
+-   Name it (e.g., `streaming-app-bucket`) and copy this into your `.env` as `R2_BUCKET_NAME`.
+
+### 2️⃣ Generate API Tokens
+
+-   Go to R2 > **Manage R2 API Tokens** > **Create API Token**.
+-   **Permissions**: Select **Admin Read/Write**.
+-   **TTL**: Preferably `Forever`.
+-   Copy the `Access Key ID` and `Secret Access Key` into your `.env`.
+
+### 3️⃣ ⚠️ Critical: CORS & ETag Configuration
+
+For **Resumable Uploads** to work, the browser must be able to see the `ETag` header from R2.
+
+-   Go to your Bucket > **Settings** > **CORS Policy**.
+-   Add the following JSON (or use our `set-r2-cors.ts` script):
+
+```json
+[
+    {
+        "AllowedOrigins": ["*"],
+        "AllowedMethods": ["GET", "PUT", "POST", "DELETE", "HEAD"],
+        "AllowedHeaders": ["*"],
+        "ExposeHeaders": ["ETag", "Content-Range"],
+        "MaxAgeSeconds": 3600
+    }
+]
+```
+
+> [!IMPORTANT]
+> Without `ExposeHeaders: ["ETag"]`, the Resumable Upload logic will fail silently because it won't be able to track finished parts!
+
+### 4️⃣ Enable Public Access (Optional for Playback)
+
+-   If you aren't using a custom domain, go to **Settings** > **Public Bucket UI** and enable the **R2.dev subdomain**.
+-   Copy the `Public Bucket URL` into your `.env` as `R2_PUBLIC_URL`.
+
+---
+
 ## 🚀 How to Run It
 
 1. **Start Services** (Postgres & Redis):
