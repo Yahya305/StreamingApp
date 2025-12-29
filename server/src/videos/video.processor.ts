@@ -115,8 +115,9 @@ export class VideoProcessor extends WorkerHost {
                 },
             });
 
-            // Cleanup Redis progress
+            // Cleanup Redis progress and original video from R2
             await this.redisService.deleteProgress(videoId);
+            await this.storageService.deletePrefix(`uploads/${videoId}/`);
 
             this.logger.log(
                 `Video ${videoId} processed and uploaded successfully.`
