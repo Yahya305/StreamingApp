@@ -1,13 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Upload, X, Film, AlertCircle, Loader2 } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import axios from "axios";
 
 export const Route = createFileRoute("/upload")({
     component: UploadPage,
 });
 
-const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks for better granularity
 
 function UploadPage() {
     const [dragActive, setDragActive] = useState(false);
@@ -58,14 +58,57 @@ function UploadPage() {
 
         setUploading(true);
         const fingerprint = getFileFingerprint(file);
-        const savedUpload = localStorage.getItem(`upload_${fingerprint}`);
-        let { videoId, uploadId, key, uploadedParts } = savedUpload
-            ? JSON.parse(savedUpload)
-            : { videoId: null, uploadId: null, key: null, uploadedParts: [] };
+        console.log(
+            `%c[Upload] Started session for: ${file.name}`,
+            "color: blue; font-weight: bold;"
+        );
+        console.log(`[Upload] File Fingerprint: ${fingerprint}`);
+
+        const savedUploadRaw = localStorage.getItem(`upload_${fingerprint}`);
+        let resumeData = {
+            videoId: null as string | null,
+            uploadId: null as string | null,
+            key: null as string | null,
+            uploadedParts: [] as { ETag: string; PartNumber: number }[],
+        };
+
+        if (savedUploadRaw) {
+            try {
+                const parsed = JSON.parse(savedUploadRaw);
+                resumeData = {
+                    videoId: parsed.videoId,
+                    uploadId: parsed.uploadId,
+                    key: parsed.key,
+                    uploadedParts: (parsed.uploadedParts || []).map(
+                        (p: any) => ({
+                            ETag: p.ETag || p.etag,
+                            PartNumber: p.PartNumber || p.partNumber,
+                        })
+                    ),
+                };
+                console.log(
+                    `%c[Upload] 🟢 Existing session found! Resuming Video: ${resumeData.videoId}`,
+                    "color: green; font-weight: bold;"
+                );
+                console.log(
+                    `[Upload] Already uploaded parts: ${resumeData.uploadedParts.length}`
+                );
+            } catch (e) {
+                console.warn(
+                    "[Upload] Failed to parse resume data, starting fresh.",
+                    e
+                );
+            }
+        }
+
+        let { videoId, uploadId, key, uploadedParts } = resumeData;
 
         try {
             // 1. Initialize or Resume Upload
             if (!uploadId) {
+                console.log(
+                    "[Upload] 🔵 Initializing new upload session via backend..."
+                );
                 const initRes = await axios.post(
                     "http://localhost:3000/videos/init-upload",
                     {
@@ -93,18 +136,36 @@ function UploadPage() {
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
             const parts = [...uploadedParts];
 
+            // Immediate progress sync for resumed uploads
+            if (parts.length > 0) {
+                const resumedProgress = Math.round(
+                    (parts.length / totalChunks) * 100
+                );
+                console.log(
+                    `[Upload] 📊 Syncing UI to resumed progress: ${resumedProgress}%`
+                );
+                setProgress(resumedProgress);
+            }
+
             // 2. Upload Chunks
             for (let i = 0; i < totalChunks; i++) {
                 const partNumber = i + 1;
 
                 // Skip if already uploaded
                 if (parts.find((p) => p.PartNumber === partNumber)) {
+                    console.log(
+                        `[Upload] ⏩ Skipping part ${partNumber} (already in R2)`
+                    );
                     continue;
                 }
 
                 const start = i * CHUNK_SIZE;
                 const end = Math.min(start + CHUNK_SIZE, file.size);
                 const chunk = file.slice(start, end);
+
+                console.log(
+                    `[Upload] 📤 Preparing part ${partNumber}/${totalChunks}...`
+                );
 
                 // Get Signed URL
                 const urlRes = await axios.get(
@@ -114,54 +175,93 @@ function UploadPage() {
                     }
                 );
 
-                // Direct PUT to R2
-                const uploadRes = await axios.put(
-                    urlRes.data.signedUrl,
-                    chunk,
-                    {
-                        headers: { "Content-Type": file.type || "video/mp4" },
-                        onUploadProgress: (p) => {
-                            const chunkProgress =
-                                (p.loaded / (p.total || 1)) * 100;
-                            const overallProgress = Math.round(
-                                ((i + chunkProgress / 100) / totalChunks) * 100
+                // Direct PUT to R2 with retries
+                let retryCount = 0;
+                let success = false;
+                while (!success && retryCount < 3) {
+                    try {
+                        const uploadRes = await axios.put(
+                            urlRes.data.signedUrl,
+                            chunk,
+                            {
+                                headers: {
+                                    "Content-Type": file.type || "video/mp4",
+                                },
+                                onUploadProgress: (p) => {
+                                    const chunkProgress =
+                                        (p.loaded / (p.total || 1)) * 100;
+                                    const overallProgress = Math.round(
+                                        ((i + chunkProgress / 100) /
+                                            totalChunks) *
+                                            100
+                                    );
+                                    setProgress(overallProgress);
+                                },
+                            }
+                        );
+
+                        // ETag fix
+                        const rawEtag =
+                            uploadRes.headers.etag || uploadRes.headers.ETag;
+                        if (!rawEtag) {
+                            throw new Error(
+                                "R2 ETag missing. Please check CORS ExposeHeaders."
                             );
-                            setProgress(overallProgress);
-                        },
+                        }
+                        const etag = rawEtag.replace(/"/g, "");
+
+                        parts.push({ ETag: etag, PartNumber: partNumber });
+                        success = true;
+
+                        console.log(
+                            `[Upload] ✅ Part ${partNumber}/${totalChunks} finished and persisted.`
+                        );
+
+                        // Persistent incremental save
+                        localStorage.setItem(
+                            `upload_${fingerprint}`,
+                            JSON.stringify({
+                                videoId,
+                                uploadId,
+                                key,
+                                uploadedParts: parts,
+                            })
+                        );
+                    } catch (err) {
+                        retryCount++;
+                        console.error(
+                            `[Upload] ⚠️ Part ${partNumber} attempt ${retryCount} failed.`,
+                            err
+                        );
+                        if (retryCount >= 3) throw err;
+                        await new Promise((r) => setTimeout(r, 2000));
                     }
-                );
-
-                const etag = uploadRes.headers.etag;
-                parts.push({ ETag: etag, PartNumber: partNumber });
-
-                // Save progress
-                localStorage.setItem(
-                    `upload_${fingerprint}`,
-                    JSON.stringify({
-                        videoId,
-                        uploadId,
-                        key,
-                        uploadedParts: parts,
-                    })
-                );
+                }
             }
 
             // 3. Complete Upload
+            console.log(
+                "[Upload] 🏁 All parts uploaded. Requesting completion..."
+            );
             setProgress(100);
             await axios.post("http://localhost:3000/videos/complete-upload", {
-                videoId,
-                uploadId,
-                key,
+                videoId: videoId!,
+                uploadId: uploadId!,
+                key: key!,
                 parts,
             });
 
             localStorage.removeItem(`upload_${fingerprint}`);
             setUploading(false);
-            startProcessingStatus(videoId);
+            startProcessingStatus(videoId!);
         } catch (error) {
-            console.error("Upload failed", error);
+            console.error("[Upload] ❌ Critical failure:", error);
+            const errorMessage = axios.isAxiosError(error)
+                ? error.response?.data?.message || error.message
+                : (error as Error).message;
+
             alert(
-                "Upload failed. Don't worry, you can resume by selecting the same file again!"
+                `Upload failed: ${errorMessage}. Don't worry, you can resume by selecting the same file again!`
             );
             setUploading(false);
         }
